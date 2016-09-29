@@ -1,54 +1,80 @@
 require 'default_where/not'
 require 'default_where/range'
+require 'default_where/like'
 require 'default_where/order'
+require 'default_where/where'
 
 module DefaultWhere
   include DefaultWhere::Not
   include DefaultWhere::Range
   include DefaultWhere::Order
+  include DefaultWhere::Like
+  include DefaultWhere::Where
 
-  def default_where(params = {})
+  REJECT = ['', ' ', nil]
+
+
+  def default_where(params = {}, options = {})
     return all if params.blank?
 
-    params, tables = params_with_table(params)
+    where_params = filter_where(params)
+    params, refs, tables = params_with_table(params, options)
 
     range_params = filter_range(params)
-    params = params.except!(*range_params.keys)
-
     order_params = filter_order(params)
-    params = params.except!(*order_params.keys)
-
     not_params = filter_not(params)
-    equal_params = params.except!(*not_params.keys)
+    like_params = filter_like(params)
 
-    joins(tables).where(equal_params)
+    equal_params = params.except!(*range_params.keys, *order_params.keys, *not_params.keys, *like_params.keys)
+
+    relation = includes(refs).where(equal_params).references(tables)
       .not_scope(not_params)
+      .like_scope(like_params)
       .range_scope(range_params)
       .order_scope(order_params)
+    where_scope(relation, where_params)
   end
 
-  def params_with_table(params)
+  def params_with_table(params = {}, options = {})
+    if options[:reject]
+      default_reject = options[:reject]
+    elsif options[:allow]
+      default_reject = REJECT - options[:allow]
+    else
+      default_reject = REJECT
+    end
+
+    # todo secure bug
     if params.respond_to?(:permitted?) && !params.permitted?
       params.permit!
     end
 
     params = params.to_h
     params.stringify_keys!
-    params.reject! { |_, value| value == '' }
+    params.reject! { |_, value| default_reject.include?(value) }
 
+    refs = []
     tables = []
 
     # since 1.9 is using lazy iteration
     params.to_a.each do |key, _|
 
       if key =~ /\./
-        as, col = key.split('.')
+        table, col = key.split('.')
         f_col, _ = col.split('-')
-        as_model = reflections[as]
+        as_model = reflections[table]
 
         if as_model && as_model.klass.column_names.include?(f_col)
           params["#{as_model.table_name}.#{col}"] = params.delete(key)
-          tables << as.to_sym
+          refs << table.to_sym
+          tables << as_model.klass.table_name
+        elsif connection.tables.include? table
+          tables << table
+          keys = reflections.select { |_, v| v.table_name == table }.keys
+          if keys && keys.size == 1
+            refs << keys.first
+          end
+          next
         else
           params.delete(key)
         end
@@ -63,7 +89,7 @@ module DefaultWhere
 
     end
 
-    [params, tables]
+    [params, refs, tables]
   end
 
 end
